@@ -15,6 +15,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -45,6 +46,8 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
 CONFIG = Path.home() / ".config/burbuja-wa"
 DATOS = Path.home() / ".local/share/burbuja-wa"
 ESTADO = CONFIG / "estado.json"
+SONIDO = "/usr/share/sounds/Yaru/stereo/message-new-instant.oga"  # al llegar un mensaje
+VOLUMEN = 100            # % del volumen del sistema (más de 100 lo amplifica)
 # Pega una imagen (PNG en base64) en el elemento activo de WhatsApp Web.
 PEGAR_JS = """(function (b64) {
   const bin = atob(b64), bytes = new Uint8Array(bin.length);
@@ -244,6 +247,9 @@ class Chat(Gtk.Window):
         ctx.set_spell_checking_enabled(True)
         ctx.set_spell_checking_languages(["es_ES", "en_US"])
         ctx.connect("download-started", self._al_descargar)
+        # notificaciones permitidas desde el arranque: sin depender del aviso de la página
+        ctx.connect("initialize-notification-permissions", lambda c: c.initialize_notification_permissions(
+            [WebKit2.SecurityOrigin.new_for_uri(URL)], []))
 
         contenido = WebKit2.UserContentManager()
         for archivo, es_css in (("compacto.css", True), ("compacto.js", False)):
@@ -274,6 +280,9 @@ class Chat(Gtk.Window):
         web.connect("create", self._al_crear)
         web.connect("context-menu", self._al_menu)
         web.connect("notify::title", self._al_titulo)
+        # al cargar o recargar, los no leídos que ya había no son mensajes nuevos
+        web.connect("load-changed", lambda _w, ev: ev == WebKit2.LoadEvent.STARTED and setattr(
+            self, "_silencio_hasta", GLib.get_monotonic_time() + 30_000_000))
         web.set_zoom_level(leer_estado().get("zoom", ZOOM))
         web.load_uri(URL)
         return web
@@ -289,11 +298,31 @@ class Chat(Gtk.Window):
 
     def _al_notificar(self, _web, notif):
         notif.connect("clicked", lambda *_: self.mostrar())
+        self._sonar()
         return False  # que WebKit la muestre como notificación del sistema
 
     def _al_titulo(self, web, _p):
         m = re.match(r"\((\d+)\)", web.get_title() or "")
-        self.al_cambiar_no_leidos(int(m.group(1)) if m else 0)
+        self._contar(int(m.group(1)) if m else 0)
+
+    def _contar(self, n):
+        """Actualiza la burbuja y suena si llegó algo nuevo (n: no leídos, -1 = sin número)."""
+        if abs(n) > abs(getattr(self, "_no_leidos", 0)):
+            self._sonar()
+        self._no_leidos = n
+        self.al_cambiar_no_leidos(n)
+
+    def _sonar(self):
+        # suena el sistema, no la página; una vez aunque lleguen aviso y contador juntos,
+        # y no si el chat está al frente o la página acaba de cargar
+        ahora = GLib.get_monotonic_time()
+        if (self.is_active() or ahora - getattr(self, "_ultimo_sonido", 0) < 2_000_000
+                or ahora < getattr(self, "_silencio_hasta", 0)):
+            return
+        self._ultimo_sonido = ahora
+        if Path(SONIDO).exists():
+            subprocess.Popen(["paplay", f"--volume={65536 * VOLUMEN // 100}", SONIDO],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     @staticmethod
     def _es_externo(uri):
