@@ -226,8 +226,8 @@ class Chat(Gtk.Window):
         try:  # WebKitGTK >= 2.34: liberar memoria al acercarse a MEMORIA_MB
             presion = WebKit2.MemoryPressureSettings.new()
             presion.set_memory_limit(MEMORIA_MB)
-            presion.set_conservative_threshold(0.5)   # desde ~512 MB: limpieza suave
             presion.set_strict_threshold(0.8)         # desde ~820 MB: limpieza agresiva
+            presion.set_conservative_threshold(0.5)   # desde ~512 MB: limpieza suave (debe ir después)
             ctx = WebKit2.WebContext(website_data_manager=gestor, memory_pressure_settings=presion)
         except (AttributeError, TypeError):
             ctx = WebKit2.WebContext.new_with_website_data_manager(gestor)
