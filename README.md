@@ -39,6 +39,9 @@ burbuja-wa
 Requiere `python3-gi`, `python3-gi-cairo` y `gir1.2-webkit2-4.1` (Ubuntu 24.04) o `gir1.2-webkit2-4.0` (Ubuntu 22.04).
 La primera vez hay que escanear el QR con el celular.
 
+El instalador también crea el lanzador "WhatsApp" (menú de aplicaciones), lo ancla
+en el dock, lo agrega al inicio automático y configura el atajo `Super+W`.
+
 ## Archivos en tu equipo
 
 - `~/.config/burbuja-wa/estado.json`: posición, tamaño y zoom.

@@ -28,6 +28,27 @@ X-GNOME-Autostart-enabled=true
 X-GNOME-Autostart-Delay=3
 DESK
 
+# lanzador para el menú de aplicaciones y el dock (StartupWMClass agrupa la ventana del chat)
+mkdir -p ~/.local/share/applications
+cat > ~/.local/share/applications/burbuja-wa.desktop <<DESK
+[Desktop Entry]
+Type=Application
+Name=WhatsApp
+Comment=Burbuja flotante con WhatsApp Web
+Exec=$HOME/.local/bin/burbuja-wa --toggle
+Icon=$DIR/assets/wa-icono.svg
+Terminal=false
+Categories=Network;Chat;InstantMessaging;
+StartupWMClass=BurbujaWA
+DESK
+
+# anclar en el dock si no está
+FAV=$(gsettings get org.gnome.shell favorite-apps)
+if [[ $FAV != *"'burbuja-wa.desktop'"* ]]; then
+  if [[ $FAV == "@as []" || $FAV == "[]" ]]; then FAV="['burbuja-wa.desktop']"; else FAV="${FAV%]}, 'burbuja-wa.desktop']"; fi
+  gsettings set org.gnome.shell favorite-apps "$FAV"
+fi
+
 # atajo Super+W -> burbuja-wa --toggle
 BASE=org.gnome.settings-daemon.plugins.media-keys
 RUTA=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/burbuja-wa/
