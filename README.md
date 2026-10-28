@@ -36,7 +36,7 @@ de ZapZap ni de otro cliente.
 burbuja-wa
 ```
 
-Requiere `python3-gi`, `python3-gi-cairo` y `gir1.2-webkit2-4.0` (Ubuntu 22.04).
+Requiere `python3-gi`, `python3-gi-cairo` y `gir1.2-webkit2-4.1` (Ubuntu 24.04) o `gir1.2-webkit2-4.0` (Ubuntu 22.04).
 La primera vez hay que escanear el QR con el celular.
 
 ## Archivos en tu equipo

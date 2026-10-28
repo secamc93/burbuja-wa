@@ -4,7 +4,10 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 sudo_falta=()
-python3 -c 'import gi; gi.require_version("WebKit2", "4.0")' 2>/dev/null || sudo_falta+=(gir1.2-webkit2-4.0)
+if ! python3 -c 'import gi; gi.require_version("WebKit2", "4.1")' 2>/dev/null &&
+   ! python3 -c 'import gi; gi.require_version("WebKit2", "4.0")' 2>/dev/null; then
+  if apt-cache show gir1.2-webkit2-4.1 >/dev/null 2>&1; then sudo_falta+=(gir1.2-webkit2-4.1); else sudo_falta+=(gir1.2-webkit2-4.0); fi
+fi
 python3 -c 'import cairo' 2>/dev/null || sudo_falta+=(python3-gi-cairo)
 if ((${#sudo_falta[@]})); then
   echo "Instalando dependencias: ${sudo_falta[*]}"

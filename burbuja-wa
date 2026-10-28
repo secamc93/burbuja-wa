@@ -21,7 +21,10 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-gi.require_version("WebKit2", "4.0")
+try:
+    gi.require_version("WebKit2", "4.1")  # Ubuntu 24.04+
+except ValueError:
+    gi.require_version("WebKit2", "4.0")  # Ubuntu 22.04
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, WebKit2  # noqa: E402
 
