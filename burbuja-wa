@@ -10,6 +10,7 @@ Un solo proceso: la burbuja + una ventana con WhatsApp Web (WebKitGTK).
 - El número de no leídos aparece en la burbuja.
 - `burbuja-wa --toggle` (atajo Super+W): igual que hacer clic.
 """
+import base64
 import json
 import os
 import re
@@ -41,6 +42,16 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
 CONFIG = Path.home() / ".config/burbuja-wa"
 DATOS = Path.home() / ".local/share/burbuja-wa"
 ESTADO = CONFIG / "estado.json"
+# Pega una imagen (PNG en base64) en el elemento activo de WhatsApp Web.
+PEGAR_JS = """(function (b64) {
+  const bin = atob(b64), bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const dt = new DataTransfer();
+  dt.items.add(new File([bytes], "imagen.png", {type: "image/png"}));
+  const destino = document.activeElement || document.body;
+  destino.dispatchEvent(new ClipboardEvent("paste",
+    {clipboardData: dt, bubbles: true, cancelable: true}));
+})(%s);"""
 ASSETS = Path(__file__).resolve().parent / "assets"
 LOGO = ASSETS / "wa.svg"              # logo de WhatsApp en blanco (simple-icons)
 LOGO_APP = ASSETS / "wa-icono.svg"    # logo sobre círculo verde, para la ventana
@@ -309,8 +320,27 @@ class Chat(Gtk.Window):
             self.zoom(None)
         elif ctrl and ev.keyval == Gdk.KEY_r or ev.keyval == Gdk.KEY_F5:
             self.web.reload()
+        elif (ctrl and ev.keyval in (Gdk.KEY_v, Gdk.KEY_V)) or \
+                (ev.state & Gdk.ModifierType.SHIFT_MASK and ev.keyval == Gdk.KEY_Insert):
+            return self._pegar_imagen()
         else:
             return False
+        return True
+
+    def _pegar_imagen(self):
+        """WebKitGTK no pasa imágenes del portapapeles a la página: si hay una
+        imagen (y no texto), se la entregamos a WhatsApp como un evento de pegado."""
+        portapapeles = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        if portapapeles.wait_is_text_available() or not portapapeles.wait_is_image_available():
+            return False  # pegado normal de WebKit
+        imagen = portapapeles.wait_for_image()
+        if imagen is None:
+            return False
+        ok, datos = imagen.save_to_bufferv("png", [], [])
+        if not ok:
+            return False
+        b64 = base64.b64encode(datos).decode()
+        self.web.run_javascript(PEGAR_JS % json.dumps(b64), None, None, None)
         return True
 
     def zoom(self, cambio):
