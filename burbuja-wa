@@ -477,7 +477,7 @@ class Burbuja(Gtk.Window):
         self._presion = None
         self._arrastrando = False
         self.chat = Chat(self._set_no_leidos)
-        self.chat.al_cambiar_estado = self.queue_draw
+        self.chat.al_cambiar_estado = self._chat_cambio
         self._ultima_pos = None
 
         self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
@@ -492,8 +492,9 @@ class Burbuja(Gtk.Window):
         self.connect("configure-event", self.al_configurar)
         self.connect("realize", self._forma_circular)
         self.connect("destroy", Gtk.main_quit)
-        self.chat.connect("show", lambda *_: self.queue_draw())
-        self.chat.connect("hide", lambda *_: self.queue_draw())
+        self.chat.connect("show", lambda *_: self._chat_cambio())
+        self.chat.connect("hide", lambda *_: self._chat_cambio())
+        self.chat.connect("configure-event", lambda *_: self._chat_cambio() or False)
 
         self.move(*self._posicion_inicial())
         self.show_all()
@@ -570,6 +571,32 @@ class Burbuja(Gtk.Window):
         mons = [pantalla.get_monitor(i).get_workarea() for i in range(pantalla.get_n_monitors())]
         mon = max(mons, key=lambda m: m.x)
         return mon.x + mon.width - TAM - MARGEN, mon.y + mon.height - TAM - MARGEN
+
+    def _chat_cambio(self):
+        self.queue_draw()
+        # tras mover/redimensionar, la posición nueva del chat llega después
+        if not getattr(self, "_revision", None):
+            self._revision = GLib.idle_add(self._revisar_solape)
+
+    def _revisar_solape(self):
+        """Si el chat abierto queda debajo de la burbuja (p. ej. maximizado), la
+        burbuja se oculta para no tapar el botón de enviar; vuelve al cerrarlo."""
+        self._revision = None
+        if self.get_visible():
+            self._pos_visible = self.get_position()
+        bx, by = getattr(self, "_pos_visible", None) or self.get_position()
+        c = self.chat
+        tapa = False
+        if c.get_visible() and not c.minimizado:
+            cx, cy = c.get_position()
+            cw, ch = c.get_size()
+            tapa = bx < cx + cw and cx < bx + TAM and by < cy + ch and cy < by + TAM
+        if tapa and self.get_visible():
+            self.hide()
+        elif not tapa and not self.get_visible():
+            self.move(bx, by)
+            self.show()
+        return False
 
     def _monitor_actual(self):
         x, y = self.get_position()
