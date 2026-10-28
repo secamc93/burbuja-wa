@@ -50,7 +50,8 @@ en el dock, lo agrega al inicio automático y configura el atajo `Super+W`.
 ## Ajustes rápidos
 
 Constantes al inicio de `burbuja-wa`: `TAM` (diámetro de la burbuja), `MEMORIA_MB`
-(límite de RAM antes de liberar memoria), `RADIO`
+(límite de RAM antes de liberar cachés), `RECICLAR_MB` / `REPOSO_MIN` (con el chat
+sin usar ese rato y la página por encima de ese tamaño, se recarga en un proceso nuevo), `RADIO`
 (redondeo del chat), `ZOOM` (zoom por defecto), `CHAT_ANCHO` / `CHAT_ALTO`.
 
 El logo viene de [Simple Icons](https://simpleicons.org/) (CC0). WhatsApp es una

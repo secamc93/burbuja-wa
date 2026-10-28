@@ -35,7 +35,9 @@ SEPARACION = 10           # entre la burbuja y el chat
 MARGEN = 20               # posición inicial respecto a la esquina
 BORDE = 4                 # grosor del borde para redimensionar el chat
 RADIO = 28                # esquinas redondeadas del chat
-MEMORIA_MB = 1024        # sobre este uso WebKit libera memoria a la fuerza (no mata la página)
+MEMORIA_MB = 1536         # sobre este uso WebKit libera cachés a la fuerza (no mata la página)
+RECICLAR_MB = 1200        # si la página pasa de esto con el chat en reposo, se recarga en un proceso nuevo
+REPOSO_MIN = 10           # minutos sin usar el chat para considerarlo en reposo
 ZOOM = 1.15               # zoom inicial de WhatsApp (Ctrl +/- lo cambia y se recuerda)
 URL = "https://web.whatsapp.com/"
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
@@ -137,6 +139,10 @@ class Chat(Gtk.Window):
         barra.connect("button-press-event", self._al_presionar_barra)
 
         self.web = self._crear_web()
+        # la página crece sin parar con el uso: en reposo se recicla (ver _revisar_memoria)
+        self._ultimo_uso = GLib.get_monotonic_time()
+        self.web.connect("web-process-terminated", self._al_morir_web)
+        GLib.timeout_add_seconds(60, self._revisar_memoria)
         # el menú de clic derecho no puede esperar al portapapeles: se sigue su estado aquí
         self._imagen_copiada = False
         portapapeles = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
@@ -418,8 +424,54 @@ class Chat(Gtk.Window):
         self.stick() if fijo else self.unstick()
 
     def _al_desenfocar(self, *_):
-        self.ultimo_desenfoque = GLib.get_monotonic_time()
+        self.ultimo_desenfoque = self._ultimo_uso = GLib.get_monotonic_time()
         return False
+
+    def _memoria_web(self):
+        """Memoria (MB, PSS) del proceso de WebKit más grande de esta app."""
+        mayor, yo = 0, str(os.getpid())
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    if f.read().rsplit(") ", 1)[1].split()[1] != yo:
+                        continue
+                with open(f"/proc/{pid}/smaps_rollup") as f:
+                    kb = sum(int(l.split()[1]) for l in f if l.startswith("Pss:"))
+            except (OSError, IndexError, ValueError):
+                continue
+            mayor = max(mayor, kb // 1024)
+        return mayor
+
+    def _ocupado(self):
+        """True si hay audio sonando o micrófono / cámara / pantalla en uso (llamadas)."""
+        w = self.web
+        if w.is_playing_audio():
+            return True
+        apagado = getattr(WebKit2, "MediaCaptureState", None)
+        for nombre in ("get_microphone_capture_state", "get_camera_capture_state",
+                       "get_display_capture_state"):
+            estado = getattr(w, nombre, None)
+            if estado and apagado and estado() != apagado.NONE:
+                return True
+        return False
+
+    def _revisar_memoria(self):
+        ahora = GLib.get_monotonic_time()
+        if self.is_active() or self._ocupado():
+            self._ultimo_uso = ahora
+        elif ahora - self._ultimo_uso > REPOSO_MIN * 60_000_000 and self._memoria_web() > RECICLAR_MB:
+            self._ultimo_uso = ahora   # no volver a intentarlo hasta otro rato de reposo
+            try:
+                self.web.terminate_web_process()   # -> _al_morir_web carga de nuevo
+            except AttributeError:                  # WebKitGTK < 2.34
+                self.web.reload()
+        return True
+
+    def _al_morir_web(self, web, _motivo):
+        # reciclado, caída o exceso de memoria: se vuelve a cargar en un proceso nuevo
+        GLib.timeout_add_seconds(1, lambda: web.load_uri(URL) or False)
 
     def recien_activo(self):
         # el clic en la burbuja puede quitarle el foco justo antes de llegar
