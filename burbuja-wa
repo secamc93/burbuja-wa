@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""Burbuja flotante de WhatsApp, propia (sin ZapZap). X11 / GNOME.
+
+Un solo proceso: la burbuja + una ventana con WhatsApp Web (WebKitGTK).
+- Clic en la burbuja: muestra el chat junto a ella / lo trae al frente / lo oculta.
+- Arrastrar la burbuja: la mueve (recuerda la posición).
+- Clic derecho: menú (fijar encima, salir).
+- La ventana del chat es normal: se redimensiona por los bordes, la X la oculta,
+  el botón 📌 la deja siempre encima (apagado por defecto), ⤢ la maximiza.
+- El número de no leídos aparece en la burbuja.
+- `burbuja-wa --toggle` (atajo Super+W): igual que hacer clic.
+"""
+import json
+import os
+import re
+import signal
+import sys
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("WebKit2", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, WebKit2  # noqa: E402
+
+TAM = 60                  # diámetro de la burbuja
+CHAT_ANCHO, CHAT_ALTO = 440, 700
+SEPARACION = 10           # entre la burbuja y el chat
+MARGEN = 20               # posición inicial respecto a la esquina
+BORDE = 4                 # grosor del borde para redimensionar el chat
+RADIO = 28                # esquinas redondeadas del chat
+ZOOM = 1.15               # zoom inicial de WhatsApp (Ctrl +/- lo cambia y se recuerda)
+URL = "https://web.whatsapp.com/"
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+      "(KHTML, like Gecko) Version/18.0 Safari/605.1.15")
+CONFIG = Path.home() / ".config/burbuja-wa"
+DATOS = Path.home() / ".local/share/burbuja-wa"
+ESTADO = CONFIG / "estado.json"
+ASSETS = Path(__file__).resolve().parent / "assets"
+LOGO = ASSETS / "wa.svg"              # logo de WhatsApp en blanco (simple-icons)
+LOGO_APP = ASSETS / "wa-icono.svg"    # logo sobre círculo verde, para la ventana
+DESCARGAS = Path(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD)
+                 or Path.home() / "Descargas")
+PIDFILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "burbuja-wa.pid"
+
+
+def leer_estado():
+    try:
+        return json.loads(ESTADO.read_text())
+    except Exception:
+        return {}
+
+
+def guardar_estado(**cambios):
+    d = leer_estado()
+    d.update(cambios)
+    CONFIG.mkdir(parents=True, exist_ok=True)
+    ESTADO.write_text(json.dumps(d))
+
+
+# --- ventana del chat ------------------------------------------------------------
+class Chat(Gtk.Window):
+    def __init__(self, al_cambiar_no_leidos):
+        super().__init__(title="WhatsApp")
+        self.set_wmclass("burbuja-wa", "BurbujaWA")
+        if LOGO_APP.exists():
+            self.set_icon_from_file(str(LOGO_APP))
+        else:
+            self.set_icon_name("user-available")
+        est = leer_estado()
+        self.set_default_size(est.get("ancho", CHAT_ANCHO), est.get("alto", CHAT_ALTO))
+        self.al_cambiar_no_leidos = al_cambiar_no_leidos
+        self.al_cambiar_estado = None
+        self.ultimo_desenfoque = 0
+
+        # sin decoración del sistema: barra propia (arrastrar = mover) y bordes
+        # propios para redimensionar
+        self.set_decorated(False)
+        self.minimizado = False
+        self.movido = "chat_x" in est
+        if self.movido:
+            self.move(est["chat_x"], est["chat_y"])
+        css = Gtk.CssProvider()
+        css.load_from_data(b"""
+            .bwa-marco { background: #0b141a; }
+            .bwa-barra { background: #202c33; padding: 6px 18px; }
+            .bwa-barra label { color: #e9edef; font-weight: bold; margin-left: 6px; }
+            .bwa-barra button { color: #aebac1; background: none; border: none;
+                                box-shadow: none; min-width: 28px; min-height: 28px; padding: 0; }
+            .bwa-barra button:hover { background: rgba(255,255,255,.08); }
+            .bwa-barra button:checked { color: #25d366; }
+        """)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        def boton(icono, ayuda, fn, alternable=False):
+            b = (Gtk.ToggleButton if alternable else Gtk.Button)(tooltip_text=ayuda)
+            b.add(Gtk.Image.new_from_icon_name(icono, Gtk.IconSize.MENU))
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            b.connect("toggled" if alternable else "clicked", fn)
+            return b
+
+        caja = Gtk.Box(spacing=0)
+        caja.get_style_context().add_class("bwa-barra")
+        caja.pack_start(Gtk.Label(label="WhatsApp"), False, False, 0)
+        self.fijar = boton("view-pin-symbolic", "Siempre encima", self._al_fijar, True)
+        self.fijar.set_active(est.get("fijo", False))
+        for b in reversed([
+            boton("zoom-out-symbolic", "Alejar (Ctrl -)", lambda *_: self.zoom(-0.05)),
+            boton("zoom-in-symbolic", "Acercar (Ctrl +)", lambda *_: self.zoom(+0.05)),
+            boton("view-refresh-symbolic", "Recargar", lambda *_: self.web.reload()),
+            self.fijar,
+            boton("window-minimize-symbolic", "Minimizar", lambda *_: self.iconify()),
+            boton("window-maximize-symbolic", "Agrandar / achicar", lambda *_: self.alternar_grande()),
+            boton("window-close-symbolic", "Ocultar", lambda *_: self.hide()),
+        ]):
+            caja.pack_end(b, False, False, 0)
+        barra = Gtk.EventBox()
+        barra.add(caja)
+        barra.connect("button-press-event", self._al_presionar_barra)
+
+        self.web = self._crear_web()
+        interior = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        interior.pack_start(barra, False, False, 0)
+        interior.pack_start(self.web, True, True, 0)
+        interior.set_margin_start(BORDE)
+        interior.set_margin_end(BORDE)
+        interior.set_margin_bottom(BORDE)
+        interior.set_margin_top(BORDE)
+        marco = Gtk.EventBox()           # recibe los clics del borde para redimensionar
+        marco.get_style_context().add_class("bwa-marco")
+        marco.add(interior)
+        marco.add_events(Gdk.EventMask.POINTER_MOTION_MASK)
+        marco.connect("button-press-event", self._al_presionar_borde)
+        marco.connect("motion-notify-event", self._al_mover_borde)
+        self.add(marco)
+        marco.show_all()
+
+        self.connect("delete-event", lambda *_: self.hide() or True)  # la X oculta
+        self.connect("configure-event", self._al_configurar)
+        self.connect("focus-out-event", self._al_desenfocar)
+        self.connect("key-press-event", self._al_tecla)
+        self.connect("window-state-event", self._al_cambiar_estado)
+        self.connect("size-allocate", self._redondear)
+        self.connect("realize", self._redondear)
+        self._aplicar_fijo()
+
+    # --- mover / redimensionar ---
+    def _al_presionar_barra(self, _w, ev):
+        if ev.button != 1:
+            return False
+        if ev.type == Gdk.EventType._2BUTTON_PRESS:
+            self.alternar_grande()
+        else:
+            self.begin_move_drag(1, int(ev.x_root), int(ev.y_root), ev.time)
+        return True
+
+    def _borde_en(self, x, y):
+        ancho, alto = self.get_size()
+        izq, der = x < BORDE * 3, x > ancho - BORDE * 3
+        arr, aba = y < BORDE, y > alto - BORDE * 3
+        E = Gdk.WindowEdge
+        return {(True, False, True, False): E.NORTH_WEST, (False, True, True, False): E.NORTH_EAST,
+                (True, False, False, True): E.SOUTH_WEST, (False, True, False, True): E.SOUTH_EAST,
+                }.get((izq, der, arr, aba)) or (E.WEST if izq else E.EAST if der
+                                                else E.NORTH if arr else E.SOUTH if aba else None)
+
+    def _al_presionar_borde(self, _w, ev):
+        borde = self._borde_en(ev.x, ev.y)
+        if ev.button == 1 and borde is not None:
+            self.begin_resize_drag(borde, 1, int(ev.x_root), int(ev.y_root), ev.time)
+            return True
+        return False
+
+    def _al_mover_borde(self, w, ev):
+        borde = self._borde_en(ev.x, ev.y)
+        nombres = {Gdk.WindowEdge.NORTH_WEST: "nw-resize", Gdk.WindowEdge.NORTH_EAST: "ne-resize",
+                   Gdk.WindowEdge.SOUTH_WEST: "sw-resize", Gdk.WindowEdge.SOUTH_EAST: "se-resize",
+                   Gdk.WindowEdge.WEST: "w-resize", Gdk.WindowEdge.EAST: "e-resize",
+                   Gdk.WindowEdge.NORTH: "n-resize", Gdk.WindowEdge.SOUTH: "s-resize"}
+        cursor = Gdk.Cursor.new_from_name(w.get_display(), nombres[borde]) if borde is not None else None
+        w.get_window().set_cursor(cursor)
+        return False
+
+    def alternar_grande(self):
+        self.unmaximize() if self.is_maximized() else self.maximize()
+
+    def _al_cambiar_estado(self, _w, ev):
+        self.minimizado = bool(ev.new_window_state & Gdk.WindowState.ICONIFIED)
+        if self.al_cambiar_estado:
+            self.al_cambiar_estado()
+        return False
+
+    def seguir(self, dx, dy):
+        """La burbuja se movió: el chat abierto se mueve con ella."""
+        if self.get_visible() and not self.is_maximized():
+            x, y = self.get_position()
+            self.move(x + dx, y + dy)
+
+    def _crear_web(self):
+        DATOS.mkdir(parents=True, exist_ok=True)
+        gestor = WebKit2.WebsiteDataManager(base_data_directory=str(DATOS / "datos"),
+                                            base_cache_directory=str(DATOS / "cache"))
+        ctx = WebKit2.WebContext.new_with_website_data_manager(gestor)
+        ctx.get_cookie_manager().set_persistent_storage(
+            str(DATOS / "cookies.sqlite"), WebKit2.CookiePersistentStorage.SQLITE)
+        ctx.set_spell_checking_enabled(True)
+        ctx.set_spell_checking_languages(["es_ES", "en_US"])
+        ctx.connect("download-started", self._al_descargar)
+
+        contenido = WebKit2.UserContentManager()
+        for archivo, es_css in (("compacto.css", True), ("compacto.js", False)):
+            ruta = ASSETS / archivo
+            if not ruta.exists():
+                continue
+            if es_css:
+                contenido.add_style_sheet(WebKit2.UserStyleSheet(
+                    ruta.read_text(), WebKit2.UserContentInjectedFrames.TOP_FRAME,
+                    WebKit2.UserStyleLevel.USER, None, None))
+            else:
+                contenido.add_script(WebKit2.UserScript(
+                    ruta.read_text(), WebKit2.UserContentInjectedFrames.TOP_FRAME,
+                    WebKit2.UserScriptInjectionTime.END, None, None))
+
+        web = WebKit2.WebView(web_context=ctx, user_content_manager=contenido)
+        ajustes = web.get_settings()
+        ajustes.set_user_agent(UA)
+        ajustes.set_enable_media_stream(True)
+        ajustes.set_enable_webrtc(True)
+        ajustes.set_enable_webaudio(True)
+        ajustes.set_enable_mediasource(True)
+        ajustes.set_javascript_can_access_clipboard(True)
+        ajustes.set_enable_developer_extras(True)
+        web.connect("permission-request", self._al_pedir_permiso)
+        web.connect("show-notification", self._al_notificar)
+        web.connect("decide-policy", self._al_decidir)
+        web.connect("create", self._al_crear)
+        web.connect("notify::title", self._al_titulo)
+        web.set_zoom_level(leer_estado().get("zoom", ZOOM))
+        web.load_uri(URL)
+        return web
+
+    # --- WhatsApp Web ---
+    def _al_pedir_permiso(self, _web, req):
+        if isinstance(req, (WebKit2.NotificationPermissionRequest,
+                            WebKit2.UserMediaPermissionRequest,
+                            WebKit2.DeviceInfoPermissionRequest)):
+            req.allow()
+            return True
+        return False
+
+    def _al_notificar(self, _web, notif):
+        notif.connect("clicked", lambda *_: self.mostrar())
+        return False  # que WebKit la muestre como notificación del sistema
+
+    def _al_titulo(self, web, _p):
+        m = re.match(r"\((\d+)\)", web.get_title() or "")
+        self.al_cambiar_no_leidos(int(m.group(1)) if m else 0)
+
+    @staticmethod
+    def _es_externo(uri):
+        return not re.match(r"https://([a-z0-9-]+\.)*whatsapp\.(com|net)/", uri or "") \
+            and not (uri or "").startswith(("blob:", "data:", "about:"))
+
+    def _abrir_fuera(self, uri):
+        Gtk.show_uri_on_window(self, uri, Gdk.CURRENT_TIME)
+
+    def _al_decidir(self, _web, decision, tipo):
+        if tipo in (WebKit2.PolicyDecisionType.NAVIGATION_ACTION,
+                    WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION):
+            uri = decision.get_navigation_action().get_request().get_uri()
+            if self._es_externo(uri):  # enlaces de los chats: al navegador
+                self._abrir_fuera(uri)
+                decision.ignore()
+                return True
+        return False
+
+    def _al_crear(self, _web, accion):
+        uri = accion.get_request().get_uri()
+        if uri:
+            self._abrir_fuera(uri)
+        return None
+
+    def _al_descargar(self, _ctx, descarga):
+        def destino(d, sugerido):
+            DESCARGAS.mkdir(parents=True, exist_ok=True)
+            base = Path(sugerido or "archivo").name
+            ruta, n = DESCARGAS / base, 1
+            while ruta.exists():
+                ruta = DESCARGAS / f"{Path(base).stem} ({n}){Path(base).suffix}"
+                n += 1
+            d.set_destination(GLib.filename_to_uri(str(ruta)))
+            return True
+        descarga.connect("decide-destination", destino)
+
+    # --- ventana ---
+    def _al_tecla(self, _w, ev):
+        ctrl = ev.state & Gdk.ModifierType.CONTROL_MASK
+        if ctrl and ev.keyval in (Gdk.KEY_plus, Gdk.KEY_equal, Gdk.KEY_KP_Add):
+            self.zoom(+0.05)
+        elif ctrl and ev.keyval in (Gdk.KEY_minus, Gdk.KEY_KP_Subtract):
+            self.zoom(-0.05)
+        elif ctrl and ev.keyval == Gdk.KEY_0:
+            self.zoom(None)
+        elif ctrl and ev.keyval == Gdk.KEY_r or ev.keyval == Gdk.KEY_F5:
+            self.web.reload()
+        else:
+            return False
+        return True
+
+    def zoom(self, cambio):
+        nivel = ZOOM if cambio is None else min(2.0, max(0.6, self.web.get_zoom_level() + cambio))
+        self.web.set_zoom_level(round(nivel, 2))
+        guardar_estado(zoom=round(nivel, 2))
+
+    def _redondear(self, *_):
+        # recorta la ventana con esquinas redondeadas (cuadrada si está maximizada)
+        import cairo
+        ancho, alto = self.get_size()
+        if self.get_window() is None or (ancho, alto) == getattr(self, "_forma", None):
+            return
+        self._forma = (ancho, alto)
+        r = 0 if self.is_maximized() else RADIO
+        surf = cairo.ImageSurface(cairo.FORMAT_A1, ancho, alto)
+        cr = cairo.Context(surf)
+        cr.arc(ancho - r, r, r, -1.5708, 0)
+        cr.arc(ancho - r, alto - r, r, 0, 1.5708)
+        cr.arc(r, alto - r, r, 1.5708, 3.1416)
+        cr.arc(r, r, r, 3.1416, 4.7124)
+        cr.close_path()
+        cr.fill()
+        self.shape_combine_region(Gdk.cairo_region_create_from_surface(surf))
+
+    def _al_fijar(self, *_):
+        guardar_estado(fijo=self.fijar.get_active())
+        self._aplicar_fijo()
+
+    def _aplicar_fijo(self):
+        fijo = self.fijar.get_active()
+        self.set_keep_above(fijo)
+        self.stick() if fijo else self.unstick()
+
+    def _al_desenfocar(self, *_):
+        self.ultimo_desenfoque = GLib.get_monotonic_time()
+        return False
+
+    def recien_activo(self):
+        # el clic en la burbuja puede quitarle el foco justo antes de llegar
+        return self.is_active() or GLib.get_monotonic_time() - self.ultimo_desenfoque < 400_000
+
+    def _al_configurar(self, *_):
+        if getattr(self, "_guardar", None):
+            GLib.source_remove(self._guardar)
+        self._guardar = GLib.timeout_add(500, self._guardar_tamano)
+        return False
+
+    def _guardar_tamano(self):
+        self._guardar = None
+        if self.get_visible() and not self.is_maximized() and not self.minimizado:
+            ancho, alto = self.get_size()
+            x, y = self.get_position()
+            self.movido = True
+            guardar_estado(ancho=ancho, alto=alto, chat_x=x, chat_y=y)
+        return False
+
+    def mostrar(self, junto_a=None):
+        if not self.get_visible():
+            if self.movido:
+                # donde lo dejaste, pero siempre dentro de una pantalla
+                x, y = self.get_position()
+                ancho, alto = self.get_size()
+                mon = Gdk.Display.get_default().get_monitor_at_point(x + ancho // 2, y + 20).get_workarea()
+                self.move(max(mon.x, min(x, mon.x + mon.width - ancho)),
+                          max(mon.y, min(y, mon.y + mon.height - alto)))
+            elif junto_a:
+                self.move(*junto_a(self.get_size()))
+        self.deiconify()
+        self.show()
+        self._aplicar_fijo()
+        self.present_with_time(Gtk.get_current_event_time() or GLib.get_monotonic_time() // 1000)
+
+
+# --- burbuja ---------------------------------------------------------------------
+class Burbuja(Gtk.Window):
+    def __init__(self):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.set_title("Burbuja WhatsApp")
+        self.set_wmclass("burbuja-wa-icono", "BurbujaWAIcono")
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_accept_focus(False)      # que hacer clic no le robe el foco al chat
+        self.set_focus_on_map(False)
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        self.set_app_paintable(True)
+        self.set_default_size(TAM, TAM)
+        self.set_size_request(TAM, TAM)
+        visual = self.get_screen().get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+        self.stick()
+
+        self.no_leidos = 0
+        lado = int(TAM * .56)
+        self.logo = (GdkPixbuf.Pixbuf.new_from_file_at_size(str(LOGO), lado, lado)
+                     if LOGO.exists() else None)
+        self.hover = False
+        self._presion = None
+        self._arrastrando = False
+        self.chat = Chat(self._set_no_leidos)
+        self.chat.al_cambiar_estado = self.queue_draw
+        self._ultima_pos = None
+
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.ENTER_NOTIFY_MASK
+                        | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.connect("draw", self.dibujar)
+        self.connect("button-press-event", self.al_presionar)
+        self.connect("button-release-event", self.al_soltar)
+        self.connect("motion-notify-event", self.al_mover)
+        self.connect("enter-notify-event", lambda *_: self._set_hover(True))
+        self.connect("leave-notify-event", lambda *_: self._set_hover(False))
+        self.connect("configure-event", self.al_configurar)
+        self.connect("realize", self._forma_circular)
+        self.connect("destroy", Gtk.main_quit)
+        self.chat.connect("show", lambda *_: self.queue_draw())
+        self.chat.connect("hide", lambda *_: self.queue_draw())
+
+        self.move(*self._posicion_inicial())
+        self.show_all()
+
+    # --- apariencia ---
+    def _forma_circular(self, *_):
+        import cairo
+        surf = cairo.ImageSurface(cairo.FORMAT_A1, TAM, TAM)
+        cr = cairo.Context(surf)
+        cr.arc(TAM / 2, TAM / 2, TAM / 2, 0, 6.2832)
+        cr.fill()
+        self.input_shape_combine_region(Gdk.cairo_region_create_from_surface(surf))
+
+    def dibujar(self, _w, cr):
+        cr.set_operator(0)  # CLEAR
+        cr.paint()
+        cr.set_operator(2)  # OVER
+        r = TAM / 2
+        cr.set_source_rgba(0, 0, 0, .25)                   # sombra
+        cr.arc(r, r + 1.5, r - 2, 0, 6.2832)
+        cr.fill()
+        if self.chat.get_visible() and not self.chat.minimizado:
+            cr.set_source_rgb(0.07, 0.55, 0.49)            # verde oscuro: chat abierto
+        elif self.hover:
+            cr.set_source_rgb(0.20, 0.88, 0.47)
+        else:
+            cr.set_source_rgb(0.15, 0.83, 0.40)            # verde WhatsApp
+        cr.arc(r, r, r - 3, 0, 6.2832)
+        cr.fill()
+
+        if self.logo:                                      # logo de WhatsApp
+            lw, lh = self.logo.get_width(), self.logo.get_height()
+            Gdk.cairo_set_source_pixbuf(cr, self.logo, r - lw / 2, r - lh / 2)
+            cr.paint()
+        else:                                              # globo de diálogo blanco
+            cr.set_source_rgb(1, 1, 1)
+            cr.set_line_width(2.6)
+            cr.arc(r, r - 1, TAM * .24, 2.2, 2.2 + 5.6)
+            cr.line_to(r - TAM * .25, r + TAM * .24)
+            cr.close_path()
+            cr.stroke()
+
+        if self.no_leidos:
+            texto = str(self.no_leidos) if self.no_leidos < 100 else "99+"
+            cr.select_font_face("Sans", 0, 1)
+            cr.set_font_size(11)
+            ext = cr.text_extents(texto)
+            ancho = max(18, ext.width + 10)
+            bx, by = TAM - ancho - 1, 1
+            cr.set_source_rgb(0.92, 0.22, 0.22)
+            cr.arc(bx + 9, by + 9, 9, 1.5708, 4.7124)
+            cr.arc(bx + ancho - 9, by + 9, 9, -1.5708, 1.5708)
+            cr.close_path()
+            cr.fill()
+            cr.set_source_rgb(1, 1, 1)
+            cr.move_to(bx + (ancho - ext.width) / 2 - ext.x_bearing, by + 9 + ext.height / 2)
+            cr.show_text(texto)
+        return True
+
+    def _set_hover(self, v):
+        self.hover = v
+        self.queue_draw()
+
+    def _set_no_leidos(self, n):
+        self.no_leidos = n
+        self.queue_draw()
+
+    # --- posición ---
+    def _posicion_inicial(self):
+        d = leer_estado()
+        if "x" in d:
+            return d["x"], d["y"]
+        pantalla = Gdk.Display.get_default()
+        mons = [pantalla.get_monitor(i).get_workarea() for i in range(pantalla.get_n_monitors())]
+        mon = max(mons, key=lambda m: m.x)
+        return mon.x + mon.width - TAM - MARGEN, mon.y + mon.height - TAM - MARGEN
+
+    def _monitor_actual(self):
+        x, y = self.get_position()
+        return Gdk.Display.get_default().get_monitor_at_point(x + TAM // 2, y + TAM // 2).get_workarea()
+
+    def junto_a_burbuja(self, tamano):
+        ancho, alto = tamano
+        mon = self._monitor_actual()
+        bx, by = self.get_position()
+        # a la izquierda de la burbuja si cabe, si no a la derecha; alineado abajo
+        x = bx - SEPARACION - ancho
+        if x < mon.x:
+            x = bx + TAM + SEPARACION
+        y = by + TAM - alto
+        x = max(mon.x, min(x, mon.x + mon.width - ancho))
+        y = max(mon.y, min(y, mon.y + mon.height - alto))
+        return x, y
+
+    def al_configurar(self, *_):
+        # el chat abierto sigue a la burbuja mientras se arrastra
+        pos = self.get_position()
+        if self._ultima_pos and self._arrastrando and pos != self._ultima_pos:
+            self.chat.seguir(pos[0] - self._ultima_pos[0], pos[1] - self._ultima_pos[1])
+        self._ultima_pos = pos
+        # GNOME se queda con el arrastre y no avisa al soltar: se guarda cuando
+        # la burbuja lleva un momento quieta.
+        if getattr(self, "_quieta", None):
+            GLib.source_remove(self._quieta)
+        self._quieta = GLib.timeout_add(300, self._se_detuvo)
+
+    def _se_detuvo(self):
+        self._quieta = None
+        self._arrastrando = False
+        self._presion = None
+        x, y = self.get_position()
+        guardar_estado(x=x, y=y)
+        return False
+
+    # --- ratón ---
+    def al_presionar(self, _w, ev):
+        if ev.button == 3:
+            self._menu(ev)
+            return True
+        if ev.button == 1:
+            self._presion = (ev.x_root, ev.y_root)
+            self._arrastrando = False
+        return True
+
+    def al_mover(self, _w, ev):
+        if self._presion and not self._arrastrando:
+            dx, dy = ev.x_root - self._presion[0], ev.y_root - self._presion[1]
+            if dx * dx + dy * dy > 36:
+                self._arrastrando = True
+                self.begin_move_drag(1, int(self._presion[0]), int(self._presion[1]), ev.time)
+        return True
+
+    def al_soltar(self, _w, ev):
+        if ev.button == 1:
+            if self._arrastrando:
+                self._arrastrando = False
+            elif self._presion:
+                self.alternar()
+            self._presion = None
+        return True
+
+    def _menu(self, ev):
+        m = Gtk.Menu()
+        abrir = Gtk.MenuItem(label="Abrir chat")
+        abrir.connect("activate", lambda *_: self.chat.mostrar(self.junto_a_burbuja))
+        fijo = Gtk.CheckMenuItem(label="Chat siempre encima")
+        fijo.set_active(self.chat.fijar.get_active())
+        fijo.connect("toggled", lambda it: self.chat.fijar.set_active(it.get_active()))
+        recargar = Gtk.MenuItem(label="Recargar WhatsApp")
+        recargar.connect("activate", lambda *_: self.chat.web.reload())
+        salir = Gtk.MenuItem(label="Salir")
+        salir.connect("activate", lambda *_: self.salir())
+        for it in (abrir, fijo, recargar, Gtk.SeparatorMenuItem(), salir):
+            m.append(it)
+        m.show_all()
+        m.popup_at_pointer(ev)
+
+    # --- chat ---
+    def alternar(self):
+        if self.chat.get_visible() and not self.chat.minimizado and self.chat.recien_activo():
+            self.chat.hide()
+        else:
+            self.chat.mostrar(self.junto_a_burbuja)
+
+    def salir(self):
+        PIDFILE.unlink(missing_ok=True)
+        Gtk.main_quit()
+
+
+def instancia_viva():
+    try:
+        pid = int(PIDFILE.read_text())
+        os.kill(pid, 0)
+        return pid
+    except Exception:
+        return None
+
+
+def main():
+    pid = instancia_viva()
+    if pid:
+        if "--toggle" in sys.argv:
+            os.kill(pid, signal.SIGUSR1)
+        return
+    PIDFILE.write_text(str(os.getpid()))
+    burbuja = Burbuja()
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, lambda: burbuja.alternar() or True)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: burbuja.salir() or False)
+    if "--toggle" in sys.argv:
+        GLib.idle_add(lambda: burbuja.alternar() or False)
+    Gtk.main()
+    PIDFILE.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    main()

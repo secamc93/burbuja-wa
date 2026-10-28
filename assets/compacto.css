@@ -1,0 +1,41 @@
+/* Modo compacto de ZapZap: solo aplica cuando la ventana es angosta (la burbuja). */
+.zz-volver { display: none; }
+
+@media (max-width: 600px) {
+  .zz-nav { display: none !important; }
+  .zz-grid { min-width: 0 !important; width: 100% !important; }
+  #side { width: 100% !important; min-width: 0 !important; }
+  .zz-lista, .zz-chat {
+    flex: 1 1 100% !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+  }
+  html:not(.zz-en-chat) .zz-chat { display: none !important; }
+  html.zz-en-chat .zz-lista { display: none !important; }
+
+  /* info del contacto: encima del chat en vez de al lado */
+  .zz-derecha:has(> * > *) {
+    position: absolute !important;
+    inset: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    z-index: 100;
+  }
+  .zz-derecha:has(> * > *) > * { width: 100% !important; max-width: 100% !important; }
+
+  /* paneles de la izquierda (nuevo chat, perfil, ajustes) a todo el ancho */
+  :has(> [data-testid="drawer-left"]) { left: 0 !important; padding-left: 0 !important; margin-left: 0 !important; }
+  [data-testid="drawer-left"] {
+    left: 0 !important; margin-left: 0 !important; border-left: 0 !important;
+    width: 100% !important; max-width: 100% !important; flex-basis: 100% !important;
+  }
+
+  .zz-volver {
+    display: flex; align-items: center; justify-content: center;
+    flex: 0 0 auto; width: 36px; height: 36px; margin-right: 4px;
+    border: 0; border-radius: 50%; background: transparent;
+    color: var(--icon, #8696a0); cursor: pointer;
+  }
+  .zz-volver:hover { background: rgba(134,150,160,.15); }
+}
