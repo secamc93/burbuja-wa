@@ -27,7 +27,7 @@ try:
 except ValueError:
     gi.require_version("WebKit2", "4.0")  # Ubuntu 22.04
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, WebKit2  # noqa: E402
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, WebKit2  # noqa: E402
 
 TAM = 60                  # diámetro de la burbuja
 CHAT_ANCHO, CHAT_ALTO = 440, 700
@@ -136,6 +136,11 @@ class Chat(Gtk.Window):
         barra.connect("button-press-event", self._al_presionar_barra)
 
         self.web = self._crear_web()
+        # el menú de clic derecho no puede esperar al portapapeles: se sigue su estado aquí
+        self._imagen_copiada = False
+        portapapeles = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        portapapeles.connect("owner-change", lambda p, _e: p.request_targets(self._al_portapapeles))
+        portapapeles.request_targets(self._al_portapapeles)
         interior = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         interior.pack_start(barra, False, False, 0)
         interior.pack_start(self.web, True, True, 0)
@@ -251,6 +256,7 @@ class Chat(Gtk.Window):
         web.connect("show-notification", self._al_notificar)
         web.connect("decide-policy", self._al_decidir)
         web.connect("create", self._al_crear)
+        web.connect("context-menu", self._al_menu)
         web.connect("notify::title", self._al_titulo)
         web.set_zoom_level(leer_estado().get("zoom", ZOOM))
         web.load_uri(URL)
@@ -327,13 +333,39 @@ class Chat(Gtk.Window):
             return False
         return True
 
+    @staticmethod
+    def _hay_imagen():
+        """True si el portapapeles tiene una imagen y no texto."""
+        portapapeles = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        return not portapapeles.wait_is_text_available() and portapapeles.wait_is_image_available()
+
+    def _al_portapapeles(self, _p, destinos, *_):
+        destinos = destinos or []
+        self._imagen_copiada = (Gtk.targets_include_image(destinos, True)
+                                and not Gtk.targets_include_text(destinos))
+
+    def _al_menu(self, _web, menu, _ev, hit):
+        """Clic derecho > Pegar: con una imagen en el portapapeles, usa _pegar_imagen."""
+        if not hit.context_is_editable() or not self._imagen_copiada:
+            return False
+        accion = Gio.SimpleAction.new("pegar-imagen", None)
+        accion.connect("activate", lambda *_: self._pegar_imagen())
+        nuevo = WebKit2.ContextMenuItem.new_from_gaction(accion, "Pegar imagen", None)
+        for i, item in enumerate(menu.get_items()):
+            if item.get_stock_action() == WebKit2.ContextMenuAction.PASTE:
+                menu.remove(item)
+                menu.insert(nuevo, i)
+                break
+        else:
+            menu.prepend(nuevo)
+        return False
+
     def _pegar_imagen(self):
         """WebKitGTK no pasa imágenes del portapapeles a la página: si hay una
         imagen (y no texto), se la entregamos a WhatsApp como un evento de pegado."""
-        portapapeles = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-        if portapapeles.wait_is_text_available() or not portapapeles.wait_is_image_available():
+        if not self._hay_imagen():
             return False  # pegado normal de WebKit
-        imagen = portapapeles.wait_for_image()
+        imagen = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).wait_for_image()
         if imagen is None:
             return False
         ok, datos = imagen.save_to_bufferv("png", [], [])
